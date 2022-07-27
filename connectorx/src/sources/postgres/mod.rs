@@ -45,6 +45,9 @@ pub enum CSVProtocol {}
 /// Protocol - use Cursor
 pub enum CursorProtocol {}
 
+/// Protocol - use Simple Protocol
+pub enum SimpleProtocol {}
+
 type PgManager<C> = PostgresConnectionManager<C>;
 type PgConn<C> = PooledConnection<PgManager<C>>;
 
@@ -311,6 +314,37 @@ where
     }
 }
 
+impl<C> SourcePartition for PostgresSourcePartition<SimpleProtocol, C>
+where
+    C: MakeTlsConnect<Socket> + Clone + 'static + Sync + Send,
+    C::TlsConnect: Send,
+    C::Stream: Send,
+    <C::TlsConnect as TlsConnect<Socket>>::Future: Send,
+{
+    type TypeSystem = PostgresTypeSystem;
+    type Parser<'a> = PostgresSimpleSourceParser;
+    type Error = PostgresSourceError;
+
+    #[throws(PostgresSourceError)]
+    fn result_rows(&mut self) {
+        self.nrows = get_total_rows(&mut self.conn, &self.query)?;
+    }
+
+    #[throws(PostgresSourceError)]
+    fn parser(&mut self) -> Self::Parser<'_> {
+        let rows = self.conn.simple_query(self.query.as_str())?; // unless reading the data, it seems like issue the query is fast
+        PostgresSimpleSourceParser::new(rows, &self.schema)
+    }
+
+    fn nrows(&self) -> usize {
+        self.nrows
+    }
+
+    fn ncols(&self) -> usize {
+        self.ncols
+    }
+}
+
 impl<C> SourcePartition for PostgresSourcePartition<CursorProtocol, C>
 where
     C: MakeTlsConnect<Socket> + Clone + 'static + Sync + Send,
@@ -343,6 +377,8 @@ where
         self.ncols
     }
 }
+
+
 pub struct PostgresBinarySourcePartitionParser<'a> {
     iter: BinaryCopyOutIter<'a>,
     rowbuf: Vec<BinaryCopyOutRow>,
@@ -853,6 +889,218 @@ impl<'r, 'a> Produce<'r, Option<Value>> for PostgresCSVSourceParser<'a> {
                 from_str(v).map_err(|_| ConnectorXError::cannot_produce::<Value>(Some(v.into())))?
             }
         }
+    }
+}
+
+pub struct PostgresSimpleSourceParser {
+    rows: Vec<SimpleQueryMessage>,
+    ncols: usize,
+    current_col: usize,
+    current_row: usize,
+}
+impl<'a> PartitionParser<'a> for PostgresSimpleSourceParser {
+    type TypeSystem = PostgresTypeSystem;
+    type Error = PostgresSourceError;
+
+    #[throws(PostgresSourceError)]
+    fn fetch_next(&mut self) -> (usize, bool) {
+        self.current_row = 0;
+        self.current_col = 0;
+        (self.rows.len() - 1, true) // last message is command complete
+    }
+}
+
+macro_rules! impl_produce_unimplemented {
+    ($($t: ty,)+) => {
+        $(
+            impl<'r, 'a> Produce<'r, $t> for PostgresSimpleSourceParser {
+                type Error = PostgresSourceError;
+
+                #[throws(PostgresSourceError)]
+                fn produce(&'r mut self) -> $t {
+                   unimplemented!("not implemented!");
+                }
+            }
+
+            impl<'r, 'a> Produce<'r, Option<$t>> for PostgresSimpleSourceParser {
+                type Error = PostgresSourceError;
+
+                #[throws(PostgresSourceError)]
+                fn produce(&'r mut self) -> Option<$t> {
+                   unimplemented!("not implemented!");
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! impl_produce {
+    ($($t: ty,)+) => {
+        $(
+            impl<'r> Produce<'r, $t> for PostgresSimpleSourceParser {
+                type Error = PostgresSourceError;
+
+                #[throws(PostgresSourceError)]
+                fn produce(&'r mut self) -> $t {
+                    let (ridx, cidx) = self.next_loc()?;
+                    let val = match &self.rows[ridx] {
+                        SimpleQueryMessage::Row(row) => match row.try_get(cidx)? {
+                            Some(s) => s
+                                .parse()
+                                .map_err(|_| ConnectorXError::cannot_produce::<$t>(Some(s.into())))?,
+                            None => panic!("get NULL for non-NULL column"),
+                        },
+                        SimpleQueryMessage::CommandComplete(c) => {
+                            panic!("get command: {}", c);
+                        }
+                        _ => {
+                            panic!("what?");
+                        }
+                    };
+                    val
+                }
+            }
+
+            impl<'r, 'a> Produce<'r, Option<$t>> for PostgresSimpleSourceParser {
+                type Error = PostgresSourceError;
+
+                #[throws(PostgresSourceError)]
+                fn produce(&'r mut self) -> Option<$t> {
+                    let (ridx, cidx) = self.next_loc()?;
+                    let val = match &self.rows[ridx] {
+                        SimpleQueryMessage::Row(row) => match row.try_get(cidx)? {
+                            Some(s) => Some(
+                                s.parse()
+                                    .map_err(|_| ConnectorXError::cannot_produce::<$t>(Some(s.into())))?,
+                            ),
+                            None => None,
+                        },
+                        SimpleQueryMessage::CommandComplete(c) => {
+                            panic!("get command: {}", c);
+                        }
+                        _ => {
+                            panic!("what?");
+                        }
+                    };
+                    val
+                }
+            }
+        )+
+    };
+}
+
+impl_produce!(i8, i16, i32, i64, f32, f64, Decimal, Uuid,);
+
+// impl_produce!(
+//     i8,
+//     i16,
+//     i32,
+//     i64,
+//     f32,
+//     f64,
+//     Decimal,
+//     Vec<i16>,
+//     Vec<i32>,
+//     Vec<i64>,
+//     Vec<f32>,
+//     Vec<f64>,
+//     Vec<Decimal>,
+//     bool,
+//     &'r str,
+//     Vec<u8>,
+//     NaiveTime,
+//     NaiveDateTime,
+//     DateTime<Utc>,
+//     NaiveDate,
+//     Uuid,
+//     Value,
+//     HashMap<String, Option<String>>,
+// );
+impl<'r> Produce<'r, &'r str> for PostgresSimpleSourceParser {
+    type Error = PostgresSourceError;
+
+    #[throws(PostgresSourceError)]
+    fn produce(&'r mut self) -> &'r str {
+        let (ridx, cidx) = self.next_loc()?;
+        let val = match &self.rows[ridx] {
+            SimpleQueryMessage::Row(row) => match row.try_get(cidx)? {
+                Some(s) => s,
+                None => panic!("get NULL for non-NULL column"),
+            },
+            SimpleQueryMessage::CommandComplete(c) => {
+                panic!("get command: {}", c);
+            }
+            _ => {
+                panic!("what?");
+            }
+        };
+        val
+    }
+}
+
+impl<'r, 'a> Produce<'r, Option<&'r str>> for PostgresSimpleSourceParser {
+    type Error = PostgresSourceError;
+
+    #[throws(PostgresSourceError)]
+    fn produce(&'r mut self) -> Option<&'r str> {
+        let (ridx, cidx) = self.next_loc()?;
+        let val = match &self.rows[ridx] {
+            SimpleQueryMessage::Row(row) => row.try_get(cidx)?,
+            SimpleQueryMessage::CommandComplete(c) => {
+                panic!("get command: {}", c);
+            }
+            _ => {
+                panic!("what?");
+            }
+        };
+        val
+    }
+}
+
+impl<'r> Produce<'r, NaiveDate> for PostgresSimpleSourceParser {
+    type Error = PostgresSourceError;
+
+    #[throws(PostgresSourceError)]
+    fn produce(&'r mut self) -> NaiveDate {
+        let (ridx, cidx) = self.next_loc()?;
+        let val = match &self.rows[ridx] {
+            SimpleQueryMessage::Row(row) => match row.try_get(cidx)? {
+                Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .map_err(|_| ConnectorXError::cannot_produce::<NaiveDate>(Some(s.into())))?,
+                None => panic!("get NULL for non-NULL column"),
+            },
+            SimpleQueryMessage::CommandComplete(c) => {
+                panic!("get command: {}", c);
+            }
+            _ => {
+                panic!("what?");
+            }
+        };
+        val
+    }
+}
+
+impl<'r> Produce<'r, Option<NaiveDate>> for PostgresSimpleSourceParser {
+    type Error = PostgresSourceError;
+
+    #[throws(PostgresSourceError)]
+    fn produce(&'r mut self) -> Option<NaiveDate> {
+        let (ridx, cidx) = self.next_loc()?;
+        let val = match &self.rows[ridx] {
+            SimpleQueryMessage::Row(row) => match row.try_get(cidx)? {
+                Some(s) => Some(NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
+                    ConnectorXError::cannot_produce::<Option<NaiveDate>>(Some(s.into()))
+                })?),
+                None => None,
+            },
+            SimpleQueryMessage::CommandComplete(c) => {
+                panic!("get command: {}", c);
+            }
+            _ => {
+                panic!("what?");
+            }
+        };
+        val
     }
 }
 
